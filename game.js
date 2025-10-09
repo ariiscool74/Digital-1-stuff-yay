@@ -23,6 +23,26 @@ let loots = [];
 let score = 0;
 let lastSpawn = 0;
 let lastUnicornSpawn = 0;
+let boss = null;
+let bossActiveUntilScore = 1000;
+// audio context for shooting noise
+let audioCtx = null;
+
+function playShootSound() {
+    try {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const o = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        o.type = 'square';
+        o.frequency.setValueAtTime(1000 + Math.random()*400, audioCtx.currentTime);
+        g.gain.setValueAtTime(0.05, audioCtx.currentTime);
+        o.connect(g); g.connect(audioCtx.destination);
+        o.start();
+        o.stop(audioCtx.currentTime + 0.06 + Math.random()*0.04);
+    } catch (e) {
+        // audio not available
+    }
+}
 
 const player = {
     x: canvas.width / 2,
@@ -146,7 +166,7 @@ function spawnUnicorn() {
     // spawn unicorns less frequently
     let x = Math.random()*canvas.width;
     let y = Math.random()*canvas.height;
-    unicorns.push({x, y, size: ZOMBIE_SIZE, health: 20});
+    unicorns.push({x, y, size: ZOMBIE_SIZE, health: 20, vx:0, vy:0, target: null, dashCooldown: 0});
 }
 
 function spawnLoot(x, y) {
@@ -201,14 +221,78 @@ function updateZombies() {
 function updateUnicorns() {
     for (let i = unicorns.length-1; i >= 0; i--) {
         let u = unicorns[i];
-        // unicorns wander quickly
-        u.x += (Math.random()-0.5) * 3;
-        u.y += (Math.random()-0.5) * 3;
+        // unicorn AI: choose a random target occasionally, then dash toward it
+        if (!u.target || Math.random() < 0.005) {
+            u.target = {x: Math.random()*canvas.width, y: Math.random()*canvas.height};
+        }
+        let dx = u.target.x - u.x;
+        let dy = u.target.y - u.y;
+        let dist = Math.hypot(dx, dy);
+        let speed = 1.5;
+        if (u.dashCooldown <= 0 && Math.random() < 0.01) {
+            // dash
+            u.vx = (dx/dist) * 6;
+            u.vy = (dy/dist) * 6;
+            u.dashCooldown = 60 + Math.random()*60;
+        }
+        u.x += u.vx || 0;
+        u.y += u.vy || 0;
+        // slow down
+        u.vx *= 0.95;
+        u.vy *= 0.95;
+        if (dist < 10) u.target = null;
+        u.dashCooldown -= 1;
         // clamp
         u.x = Math.max(u.size/2, Math.min(canvas.width-u.size/2, u.x));
         u.y = Math.max(u.size/2, Math.min(canvas.height-u.size/2, u.y));
         // collision with player (unicorns don't hurt player)
     }
+}
+
+function spawnBoss() {
+    boss = {x: canvas.width/2, y: -100, size: 120, health: 500, vx:0, vy:1.2, attackTimer: 0};
+}
+
+function updateBoss() {
+    if (!boss) return;
+    // move into arena
+    boss.x += boss.vx;
+    boss.y += boss.vy;
+    // simple horizontal sway
+    boss.vx = Math.sin(Date.now()/500) * 1.5;
+    // attack periodically
+    boss.attackTimer -= 1;
+    if (boss.attackTimer <= 0) {
+        boss.attackTimer = 80;
+        // fire projectiles toward player
+        for (let a = -1; a <= 1; a++) {
+            let angle = Math.atan2(player.y - boss.y, player.x - boss.x) + a*0.2;
+            bullets.push({x: boss.x, y: boss.y, angle: angle, fromBoss: true});
+        }
+    }
+    // clamp inside canvas
+    boss.x = Math.max(boss.size/2, Math.min(canvas.width-boss.size/2, boss.x));
+    // boss collision with bullets handled in handleCollisions
+}
+
+function drawBoss() {
+    if (!boss) return;
+    ctx.save();
+    ctx.translate(boss.x, boss.y);
+    // big menacing body
+    ctx.fillStyle = '#6a1b9a';
+    ctx.beginPath();
+    ctx.arc(0, 0, boss.size/2, 0, Math.PI*2);
+    ctx.fill();
+    // eyes
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(-20, -10, 8, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#000'; ctx.beginPath(); ctx.arc(-20, -10, 3, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(20, -10, 8, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#000'; ctx.beginPath(); ctx.arc(20, -10, 3, 0, Math.PI*2); ctx.fill();
+    // health bar
+    ctx.fillStyle = '#000'; ctx.fillRect(-boss.size/2, boss.size/2 + 6, boss.size, 8);
+    ctx.fillStyle = '#ff5252'; ctx.fillRect(-boss.size/2, boss.size/2 + 6, boss.size * (boss.health/500), 8);
+    ctx.restore();
 }
 
 function updateParticles() {
@@ -277,6 +361,39 @@ function handleCollisions() {
             }
         }
     }
+    // boss collisions
+    if (boss) {
+        for (let j = bullets.length-1; j >= 0; j--) {
+            let b = bullets[j];
+            if (b.fromBoss) continue; // boss bullets don't hurt boss
+            let dist = Math.hypot(boss.x - b.x, boss.y - b.y);
+            if (dist < (boss.size+BULLET_SIZE)/2) {
+                boss.health -= 10;
+                bullets.splice(j, 1);
+                spawnHitEffects(b.x, b.y, 10);
+                if (boss.health <= 0) {
+                    score += 500;
+                    // clear boss and spawn big loot
+                    spawnLoot(boss.x, boss.y);
+                    boss = null;
+                    bossActiveUntilScore += 1000; // next boss threshold
+                    break;
+                }
+            }
+        }
+    }
+    // boss bullets can hit the player
+    for (let j = bullets.length-1; j >= 0; j--) {
+        let b = bullets[j];
+        if (!b.fromBoss) continue;
+        let dist = Math.hypot(player.x - b.x, player.y - b.y);
+        if (dist < (PLAYER_SIZE+BULLET_SIZE)/2) {
+            player.health -= 12;
+            spawnHitEffects(b.x, b.y, 12);
+            bullets.splice(j, 1);
+            if (player.health < 0) player.health = 0;
+        }
+    }
 }
 
 function draw() {
@@ -285,6 +402,18 @@ function draw() {
     zombies.forEach(drawZombie);
     unicorns.forEach(drawUnicorn);
     bullets.forEach(drawBullet);
+    // draw boss bullets differently
+    bullets.forEach(b => {
+        if (b.fromBoss) {
+            ctx.save();
+            ctx.translate(b.x, b.y);
+            ctx.fillStyle = '#8e24aa';
+            ctx.beginPath();
+            ctx.arc(0, 0, BULLET_SIZE/2, 0, Math.PI*2);
+            ctx.fill();
+            ctx.restore();
+        }
+    });
     loots.forEach(drawLoot);
     // draw particles
     particles.forEach(p => {
@@ -297,6 +426,8 @@ function draw() {
         ctx.textAlign = 'center';
         ctx.fillText(d.text, d.x, d.y);
     });
+    // draw boss
+    drawBoss();
 }
 
 function update() {
@@ -334,6 +465,10 @@ function gameLoop(ts) {
         spawnUnicorn();
         lastUnicornSpawn = now;
     }
+    // spawn a boss when score threshold reached
+    if (!boss && score >= bossActiveUntilScore) {
+        spawnBoss();
+    }
     update();
     draw();
     requestAnimationFrame(gameLoop);
@@ -356,6 +491,7 @@ canvas.addEventListener('mousedown', e => {
         y: player.y + Math.sin(player.angle)*PLAYER_SIZE/2,
         angle: player.angle
     });
+    playShootSound();
 });
 
 // Allow shooting with spacebar too
@@ -366,6 +502,7 @@ document.addEventListener('keydown', e => {
             y: player.y + Math.sin(player.angle)*PLAYER_SIZE/2,
             angle: player.angle
         });
+        playShootSound();
     }
 });
 
